@@ -1,0 +1,44 @@
+#jinja2: lstrip_blocks: True
+! Configuration File for keepalived
+
+vrrp_script chk_pgsql_primary {
+    script /usr/local/bin/keepalived_check_pgsql_primary.sh
+    interval 2
+    fall 2
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    state BACKUP
+    interface {{ vrrp_interface|default('eth0') }}
+
+    track_interface {
+      {{ vrrp_interface|default('eth0') }}
+    }
+
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    nopreempt
+
+    track_script {
+      chk_pgsql_primary
+    }
+
+    authentication {
+        auth_type PASS
+        auth_pass {{ vrrp_pass|default(vmdb_virtual_ip|regex_replace('\.','_')) }}
+    }
+    {% if vrrp_use_unicast|default(False) %}
+    unicast_peer {
+    {% for ip in groups['standby'] + groups['primary'] %}
+    {% if ip != inventory_hostname %}
+      {{ ip }}
+    {% endif %}
+    {% endfor %}
+    }
+    {% endif %}
+    virtual_ipaddress {
+        {{ vmdb_virtual_ip }} dev {{ vrrp_vip_interface|default('eth0') }}
+    }
+}
