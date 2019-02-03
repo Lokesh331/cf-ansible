@@ -1,0 +1,186 @@
+---
+########
+# Author: Adam Goossens <adam.goossens@gmail.com>
+#
+# This play converts an existing CloudForms/MIQ region to one that uses a
+# virtual IP for the primary VMDB. It establishes the keepalived services on each
+# primary and standby DB node, ensures the VIP is present, then updates
+# the database configuration file (/var/www/miq/vmdb/config/database.yml).
+#
+# Finally it restarts the evmserverd process across the region to ensure the changes
+# take effect.
+#
+# This play gathers all details about your region from the primary database; no inventory
+# file is required, only the variable current_primary_ip must be defined.
+#
+# Available Variables
+# -------------------
+#   vmdb_current_primary_ip   : the IP of your primary database.
+#
+#   vmdb_username             : username for your VMDB. Defaults to 'root'
+#   
+#   vmdb_password             : password for your VMDB
+#
+#   vmdb_database_to_update   : which database entry in databases.yml to update. defaults to 'production'
+#
+#   vmdb_virtual_ip           : the VIP that you want to deploy. You need to ensure this
+#                               is on the correct subnet and reachable by appliances.
+#
+#   vrrp_interface            : the interface that VRRP traffic will be carried over
+#                               defaults to eth0.
+#
+#   vrrp_vip_interface        : the interface the VIP will be added to. defaults to eth0.
+#
+#   vrrp_pass                 : a password to use for verification of the VRRP traffic. defaults
+#                               to the VIP with dots replaced by underscores (e.g. 192_168_0_1)
+#
+#   vrrp_use_unicast          : configure keepalived to use unicast to reach the standby peers.
+#                               set to true if you are on an environment that does not support multicast.
+#
+####################
+
+- hosts: localhost
+  tags:
+    - inventory
+  tasks:
+    - name: Verify required parameters provided
+      fail:
+        msg: "Required parameter {{item}} is not provided"
+      when: item is not defined
+      loop:
+        - current_primary_ip
+
+    - name: Add primary to group
+      add_host:
+        groups: 'all,vmdb,primary'
+        name: "{{ vmdb_current_primary_ip }}"
+
+    - name: Verify connectivity to current primary
+      shell: ". /etc/profile && psql -d vmdb_production -tAq -c \"SELECT pg_is_in_recovery();\""
+      register: pg_in_recovery
+      delegate_to: "{{ groups['primary'][0] }}"
+
+    - fail:
+        msg: "Unable to connect to primary."
+      when: pg_in_recovery.stdout != 'f'
+      
+
+    - name: Get details of standby DBs
+      shell: ". /etc/profile && psql -d vmdb_production -tAq -c \"SELECT conninfo FROM repl_nodes WHERE type='standby';\" | cut -f1 -d' ' | cut -f 2 -d'='"
+      register: pg_repl_slots
+      delegate_to: "{{ groups['primary'][0] }}"
+
+    - name: Add standbys to group
+      add_host:
+        groups: 'all,vmdb,standby'
+        name: "{{ item }}"
+      loop: "{{ pg_repl_slots.stdout_lines }}"
+
+    - name: Fetch hostnames of MiqServer instances
+      shell: ". /etc/profile && psql -d vmdb_production -tAq -c \"SELECT hostname FROM miq_servers\""
+      register: pg_nonvmdb_hostnames
+      delegate_to: "{{ groups['primary'][0] }}"
+
+    - name: Add non-VMDB appliances to group
+      add_host:
+        groups: 'all,nonvmdb'
+        name: "{{ item }}"
+      loop: "{{ pg_nonvmdb_hostnames.stdout_lines }}"
+
+- name: Establish keepalived and VIP on VMDB appliances
+  hosts: vmdb
+  tags:
+    - keepalived
+  tasks:
+    - name: Install keepalived
+      become: true
+      yum:
+        name: keepalived
+        state: latest
+      notify: Restart keepalived
+ 
+    - name: Template out keepalived.conf
+      become: true
+      template:
+        src: keepalived.conf.j2
+        dest: /etc/keepalived/keepalived.conf
+      notify: Restart keepalived
+ 
+    - name: Template out check script
+      become: true
+      template:
+        src: keepalived_check_pgsql_primary.sh
+        mode: 0755
+        dest: /usr/local/bin
+        setype: keepalived_unconfined_script_exec_t
+       
+    - name: Add firewalld rules for VRRP
+      become: true
+      firewalld:
+        rich_rule: 'rule protocol value="vrrp" accept'
+        permanent: yes
+        state: enabled
+        immediate: yes
+  
+  post_tasks:
+    - name: Pause for 10 seconds for keepalived to settle
+      pause:
+        seconds: 10
+
+    - name: Gather facts again
+      setup:
+
+    - name: Verify VIP present on primary
+      fail:
+        msg: "VIP is not present on the primary. Please verify state of keepalived service on primary DB"
+      when: inventory_hostname in groups['primary'] and vmdb_virtual_ip not in ansible_all_ipv4_addresses
+
+    - name: Verify VIP not present on standby
+      fail:
+        msg: |
+          VIP is present on a standby host. Please verify state of keepalived service and ensure appliances can communicate with VRRP.
+          
+          Do you need to enable vrrp_use_unicast=true?
+      when: inventory_hostname in groups['standby'] and vmdb_virtual_ip in ansible_all_ipv4_addresses
+
+  handlers:
+    - name: Restart keepalived
+      service:
+        name: keepalived
+        state: restarted
+        enabled: yes
+
+- name: Update database configuration on non-vmdb appliances
+  hosts: nonvmdb
+  tags:
+    - appliance_db_config
+  tasks:
+    - name: Load existing configuration file
+      slurp:
+        src: /var/www/miq/vmdb/config/database.yml
+      register: database_yml_raw
+
+    - set_fact:
+        databases: "{{ database_yml_raw['content'] | b64decode | from_yaml }}"
+
+    - set_fact:
+        updated_host: "{ '{{ vmdb_database_to_update|default('production') }}': { 'host': '{{ vmdb_virtual_ip }}' } }"
+
+    - set_fact:
+        new_config: "{{ databases | combine(updated_host, recursive=true) }}"
+
+    - name: Write out new configuration file
+      copy:
+        content: "{{ new_config | to_nice_yaml }}"
+        dest: /var/www/miq/vmdb/config/database.yml
+      notify: Restart CFME services
+
+  handlers:
+    - name: Restart CFME services
+      service:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - evm-watchdog
+        - evmserverd
+

@@ -1,0 +1,4 @@
+vmdb_current_primary_ip: 192.168.0.18
+vmdb_virtual_ip: 192.168.0.28
+vmdb_password: 1800redhat
+vrrp_use_unicast: true
