@@ -11,9 +11,9 @@ trigger an outage of the region.
 
 Ensure the following variables are defined:
 
-`vmdb_current_primary_ip`: the current IP for your primary database.
-`vmdb_virtual_ip`: the VIP you wish to use 
-`vmdb_password`: the password to access your VMDB (default username is 'root')
+* `vmdb_current_primary_ip`: the current IP for your primary database.
+* `vmdb_virtual_ip`: the VIP you wish to use 
+* `vmdb_password`: the password to access your VMDB (default username is 'root')
 
 See the top of the playbook for more detail about the remainder of the variables.
 
