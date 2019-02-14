@@ -41,3 +41,20 @@ cfme_zones:
     description: Management zone
   Provider:
     description: Provider zone
+
+###
+# Satellite repositories.
+#
+# These repositories will be enabled on the appliance for update work.
+#
+# Warning: avoid repositories that introduce packages that can conflict with the core 
+# CFME packages. EPEL, for example.
+#
+###
+repositories:
+  - cf-me-5.9-for-rhel-7-rpms
+  - rhel-server-rhscl-7-rpms
+  - rhel-7-server-rpms
+  - rhel-7-server-optional-rpms
+  - rhel-7-server-supplementary-rpms
+  - rhel-7-server-extras-rpms

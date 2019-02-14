@@ -1,0 +1,334 @@
+####
+# This playbook updates the entire CloudForms deployment.
+#
+# Host groups:
+#   - The playbook expects three hostgroups:
+#       - nonvmdb
+#       - vmdb
+#       - cloudforms (children: nonvmdb and vmdb)
+#
+#   - The playbook will query the VMDB appliances to determine which is the current primary and which are the standbys.
+#     This therefore assumes that pgsql is alive and running. The current primary appliance is sorted into the
+#     vmdb-primary group, and the standbys into vmdb-standby. A sanity check ensures that only a single primary is detected,
+#     and that no host exists in both the primary and standby groups.
+#
+# It does this the following way (note: this should be in line with the official methods from CF documentation):
+#
+#   - Firstly, it takes a full backup of the VMDB and stores it locally on the
+#     host running the playbook.
+#
+#   - It then takes a backup of the GUID and REGION files from each host,
+#     to assist with recovery if one of the hosts fails updating for whatever reason.
+#
+#   - It verifies the subscription status of each appliance and attempts to assign a virtual
+#     RHCI subscription if the subscription status is not current.
+#
+#   - Shuts down the evmserverd process of every appliance - this brings down the entire CloudForms deployment.
+#
+#   - Updates the standby database
+#
+#   - Updates the primary database
+#
+#   - Updates all non-DB appliances
+#
+#   - Reboots the database appliances and waits for psql to be active
+#
+#   - Reboots the non-VMDB appliances and waits for them to return - this will restart evmserverd
+#
+# The appliances will startup successfully, but they will take a further 5-10 minutes to become fully ready.
+#
+# Tags:
+#   - cfme-backup (all backup steps below)
+#   - cfme-backup-vmdb
+#   - cfme-backup-nonvmdb
+#
+#   - cfme-update (all update steps below)
+#   - cfme-update-vmdb (vmdb appliances only)
+#   - cfme-update-nonvmdb (nonvmdb appliances only)
+#   - cfme-update-schema (perform schema migration and automate domain reset)
+#
+#   - cfme-subscription (verify appliance subscription status)
+####
+---
+
+###
+# Identify which of the VMDB appliances is the primary
+# and which is the standby.
+#
+# As this can change, we find this out dynamically so we don't need
+# to constantly change the inventory file. The inventory has two placeholder 
+# groups: vmdb-primary and vmdb-standby.
+#
+# All the potential database nodes need to be in the vmdb group however.
+#
+# The standby database will have pg_is_in_recovery() == 't'. The primary will have it == 'f'.
+#
+# When stdout is t, we select matching_groups[t] == vmdb-standby and add the host to that group.
+# Similarly, when stdout is f, we select matching_groups[f] == vmdb-primary and add the host.
+##
+- hosts: localhost
+  gather_facts: false
+  become: true
+  tasks:
+    - set_fact:
+        matching_groups: { 't': 'standby_db', 'f': 'primary_db' }
+
+    - name: check pg_is_in_recovery
+      shell: ". /etc/profile && psql -d vmdb_production -tAq -c \"SELECT pg_is_in_recovery();\""
+      register: pg_in_recovery
+      delegate_to: "{{item}}"
+      with_items: "{{ groups['vmdb'] }}"
+
+    - name: add host to vmdb-primary or vmdb-standby
+      add_host: 
+        hostname: "{{ item.item }}"
+        groups: "{{ matching_groups[item.stdout] }}"
+      with_items: "{{pg_in_recovery.results}}"
+
+    - name: Verify vmdb-primary has exactly one host
+      fail:
+        msg: "Exactly one VMDB host is expected in primary_db. Found: {{ groups['primary_db'] }}"
+      when: groups['primary_db']|length != 1
+
+    - name: Verify VMDB hosts are in one group or the other, but not both
+      fail:
+        msg: "VMDB host {{ item }} was found in both primary_db and standby_db."
+      with_items: "{{ groups['vmdb'] }}"
+      when: (item in groups['primary_db']) and (item in groups['standby_db'])
+
+  tags:
+    - cfme-update
+    - cfme-update-inventory-sort
+
+##
+# Ensure subscriptions are valid on all appliances before update
+##
+- hosts: cfme
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Verify valid subscription
+      shell: subscription-manager status
+      register: sm_out
+      failed_when: sm_out.rc != 0
+
+    - name: Disable all existing repos
+      shell: "subscription-manager repos --disable='*'"
+
+    - name: Enable repositories
+      shell: "subscription-manager repos {% for repo in repositories %}--enable='{{repo}}' {%endfor%}"
+
+  tags:
+    - cfme-update
+    - cfme-subscription
+
+###
+# Backup the REGION and GUID files from all non-vmdb appliances in case of error
+#
+# Ignore errors if we're updating an appliance that hasn't yet joined a region.
+###
+- hosts: non-vmdb
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Fetch REGION and GUID file from remote appliance
+      ignore_errors: true
+      fetch:
+        src: "/var/www/miq/vmdb/{{item}}"
+        dest: "backup/{{inventory_hostname}}-{{item}}"
+        flat: yes
+      with_items:
+        - REGION
+        - GUID
+  tags:
+    - cfme-backup
+    - cfme-backup-nonvmdb
+
+###
+# Prompt for confirmation.
+###
+- hosts: cfme
+  gather_facts: false
+  tasks:
+    - pause:
+        prompt: "Have you taken a snapshot of the VMDB before continuing? Abort with Ctrl+C then 'a' if needed. Any other key to continue."
+
+###
+# Shutoff evmserverd on all non-VMDB appliances
+###
+- hosts: non-vmdb
+  any_errors_fatal: true
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Stop CloudForms services
+      service:
+        name: "{{item}}"
+        state: stopped
+      with_items:
+        - evmserverd
+        - evm-failover-monitor
+  tags:
+    - cfme-update
+    - cfme-update-nonvmdb
+
+###
+# Perform updates on the standby database first
+###
+- hosts: standby_db
+  any_errors_fatal: true
+  become: true
+  gather_facts: false
+  tasks:
+    - include_tasks: tasks/cfme-update-appliance.yml
+  tags:
+    - cfme-update-vmdb
+    - cfme-update
+
+###
+# Now update the primary database
+###
+- hosts: primary_db
+  any_errors_fatal: true
+  become: true
+  gather_facts: false
+  tasks:
+    - include_tasks: tasks/cfme-update-appliance.yml
+  tags:
+    - cfme-update-vmdb
+    - cfme-update
+
+###
+# Restart postgres on the database servers
+###
+- hosts: vmdb
+  any_errors_fatal: true
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Restore the selinux context for the PostgreSQL data directory
+      shell: restorecon -R -v /var/opt/rh/rh-postgresql95/lib/pgsql/data/
+
+    - name: Restart postgres services
+      service:
+        name: "{{ lookup('env', 'APPLIANCE_PG_SERVICE') }}"
+        state: restarted
+
+    - name: Wait for PostgreSQL to return
+      wait_for:
+        port: 5432
+        host: "{{inventory_hostname}}"
+        delay: 0
+
+  tags:
+    - cfme-update
+    - cfme-update-vmdb
+
+###
+# Now perform the update on all non-vmdb appliances
+###
+- hosts: non-vmdb
+  become: true
+  gather_facts: false
+  tasks:
+    - include_tasks: tasks/cfme-update-appliance.yml
+  tags:
+    - cfme-update-nonvmdb
+    - cfme-update
+
+###
+# Perform a database schema migration - only needs to be done on one appliance, once only, after an update.
+###
+- hosts: non-vmdb[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Perform a schema migration
+      shell: ". /etc/profile && rake db:migrate"
+      args:
+        chdir: /var/www/miq/vmdb/bin
+
+    - name: Reset the Red Hat and ManageIQ automate domains
+      shell: ". /etc/profile && rake evm:automate:reset"
+      args:
+        chdir: /var/www/miq/vmdb/bin
+
+  tags:
+    - cfme-update
+    - cfme-update-nonvmdb
+    - cfme-update-schema
+
+###
+# Reboot the database appliances; wait for them to return
+###
+- hosts: vmdb
+  gather_facts: false
+  become: true
+  tasks:
+    - include_tasks: tasks/cfme-reboot-appliance.yml
+
+    - name: Wait for PostgreSQL to come up
+      wait_for:
+        host: "{{inventory_hostname}}"
+        port: "{{cfme_pgsql_port|default(5432)}}"
+        timeout: 300
+      delegate_to: localhost
+      become: false
+
+  tags:
+    - cfme-update
+    - cfme-update-vmdb
+    - cfme-update-reboot
+
+###
+# Reboot the user-facing appliances first; wait for them to return.
+#
+# This gives them priority in the exclusive lock queue that results.
+# Enables them to come up first and be user responsive, even as the worker
+# appliances are still coming to life in the background.
+###
+- hosts: ui:api
+  gather_facts: false
+  become: true
+  tags:
+    - cfme-update
+    - cfme-update-reboot
+  tasks:
+    - include_tasks: tasks/cfme-reboot-appliance.yml
+
+    - name: Ensure evmserverd and evm-failover-monitor are both started
+      service:
+        name: "{{item}}"
+        state: started
+        enabled: yes
+      with_items:
+        - evmserverd
+        - evm-failover-monitor
+
+##
+# All the non-database, non-UI and non-API appliances.
+##
+- hosts: non-vmdb:!ui:!api
+  gather_facts: false
+  become: true
+  tasks:
+    - include_tasks: tasks/cfme-reboot-appliance.yml
+
+    - name: Ensure evmserverd and evm-failover-monitor are both started
+      service:
+        name: "{{item}}"
+        state: started
+        enabled: yes
+      with_items:
+        - evmserverd
+        - evm-failover-monitor
+
+    - debug:
+        msg: "Update complete. Appliances will take a further 5-10 minutes to become fully available, while they perform startup and commence worker initialisation."
+      run_once: true
+
+  tags:
+    - cfme-update
+    - cfme-update-nonvmdb
+    - cfme-update-reboot

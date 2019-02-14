@@ -11,6 +11,12 @@ cfme-4.home.ajg.id.au
 [provider_zone]
 cfme-5.home.ajg.id.au
 
+[ui:children]
+management_zone
+
+[api:children]
+management_zone
+
 [non-vmdb:children]
 management_zone
 provider_zone

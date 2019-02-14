@@ -1,0 +1,43 @@
+###
+# Reboot an appliance and wait for it to come back.
+#
+# This will use the reboot hint provided by /usr/bin/needs-restarting to
+# 'intelligently' determine if a reboot is actually needed. If no core libraries
+# or kernel packages were updated, generally this command should return RC=0
+#
+# If you want to force a reboot, set the fact "force_reboot=True".
+###
+---
+- name: Check if reboot required using needs-restarting
+  shell: "needs-restarting -r > /dev/null"
+  register: needs_restart
+  failed_when: false
+
+- set_fact:
+    reboot_appliance: true
+  when:
+    - ( needs_restart.rc != 0 ) or force_reboot|default(False)
+  
+- block:
+    - name: Reboot the appliance if required
+      shell: ( /bin/sleep 5 ; shutdown -r now )
+      async: 30
+      poll: 0
+
+    - name: Wait for ssh to go down
+      wait_for:
+        host: "{{inventory_hostname}}"
+        port: 22
+        state: stopped
+      delegate_to: localhost
+      become: false
+
+    - name: Wait for appliance to return
+      wait_for:
+        host: "{{inventory_hostname}}"
+        port: 22
+        delay: 15
+      delegate_to: localhost
+      become: false
+
+  when: reboot_appliance|default(false)

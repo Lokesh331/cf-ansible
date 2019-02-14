@@ -1,0 +1,20 @@
+##
+# Tasks to update a single appliance.
+#
+# Ensure the subscription is still good, enable the appropriate repositories, ensure evmserverd is off, update.
+##
+---
+- name: Stop evmserverd
+  service:
+    name: evmserverd
+    state: stopped
+
+- name: Stop the failover monitor
+  service:
+    name: evm-failover-monitor
+    state: stopped
+
+- name: Update all packages on system
+  yum:
+    name: '*'
+    state: latest
